@@ -7,17 +7,26 @@
  * clearcoat 材质会显得像塑料。
  */
 import { Suspense, lazy, memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { Canvas, useFrame, useThree } from '@react-three/fiber'
+import { Canvas, advance, useFrame, useThree } from '@react-three/fiber'
 import { Environment, Html, Lightformer, OrbitControls } from '@react-three/drei'
 import * as THREE from 'three'
 import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib'
 import type { Insect } from '../data/types'
 import type { InsectModel } from './builders/kit'
 import { loadInsectModel } from './registry'
+import { loadStageModel, type LifeStage } from './stages'
+import { applyBlended, makeEmerge, motionFor, resetEmerge, stepBlend } from './motion'
 import { bindContextLoss } from './webgl'
+import { installGLProbes, installThreeProbes, markFirstFrame, pexpose, pinfo, pmark } from '../perf'
 
 /** 后期管线懒加载：+103KB gzip 的 postprocessing 只让真正会用它的桌面端下载（详见 PostFX.tsx 头注释） */
-const PostFX = lazy(() => import('./PostFX'))
+const PostFX = lazy(() => {
+  pmark('postfx-import-start')
+  return import('./PostFX').then((m) => {
+    pmark('postfx-module-loaded')
+    return m
+  })
+})
 
 /**
  * 触屏设备一次性判定，用于渲染降配。
@@ -30,6 +39,23 @@ const PDB = typeof window !== 'undefined' && new URLSearchParams(window.location
 /** 系统「减少动态效果」：CSS 那侧有全局规则兜底，JS 驱动的触角微动在这里问一次 */
 const REDUCED_MOTION =
   typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+
+/**
+ * 羽化展翅的时长（秒）。真实的翅展开要二十分钟到一小时 —— 这个压缩与把
+ * 扑翅频率压到 4~12Hz 是同一类明摆着的取舍：真实时长没法看，
+ * 但**过程的形状是真的**（先快后慢、边展开边从下垂抬起）。
+ * 3.2 秒是「看得清在发生什么、又不至于等得不耐烦」的折中。
+ */
+const EMERGE_SECONDS = 3.2
+
+/** 主光阴影贴图边长（见 StudioLights 的注释） */
+const SHADOW_MAP_SIZE = COARSE ? 1024 : 2048
+/** 反射环境立方体贴图边长（见 StudioLights 的注释） */
+const ENV_RESOLUTION = COARSE ? 256 : 512
+
+// 把 THREE 挂进 ?perf=1 的调试出口：真机上的微基准要在**页面挂载之前**就能用
+// （后台标签页里 r3f 压根不挂载，见 README「踩过的坑」）
+pexpose({ three: THREE, loadInsectModel, advance })
 
 /** 标注四色经 CSS token 解析（var(--coral) 等），自动跟随明暗主题 */
 const TONE_VAR: Record<string, string> = {
@@ -52,6 +78,8 @@ export type ViewMode = 'normal' | 'isolate' | 'section' | 'layers'
  */
 function InsectMesh({
   model,
+  speciesId,
+  emergeNonce,
   mode,
   spin,
   pauseUntil,
@@ -63,6 +91,14 @@ function InsectMesh({
   /** 由 Scene 持有，Framing 需要用它把局部锚点换算成世界坐标 */
   groupRef: React.MutableRefObject<THREE.Group | null>
   model: InsectModel
+  /** 当前物种 id —— 动作层按它查表（查不到就是不动，没有默认动作） */
+  speciesId: string
+  /**
+   * 每次「蛹/若虫 → 成虫」自增一次，触发一遍羽化展翅。
+   * 判定放在 Scene 那一层：切阶段会重载模型，加载期间这个组件整个卸载，
+   * 记在这里的 ref 活不过那一次。
+   */
+  emergeNonce: number
   mode: ViewMode
   spin: boolean
   /** 交互后的「让转」截止时刻（performance.now() 基准） */
@@ -74,6 +110,26 @@ function InsectMesh({
   /** 触角枢轴列表（D 轮微动）；随模型重建 */
   const antennae = useRef<THREE.Group[]>([])
   const swayT = useRef(0)
+  /** 悬停振翅：累计相位与进出场的幅度权重（0=完全收拢到 rest） */
+  const motionT = useRef(0)
+  const flapBlend = useRef(0)
+  const motion = useMemo(() => motionFor(speciesId), [speciesId])
+  /**
+   * 羽化展翅：正在进行时是已过秒数，不在进行时是 null。
+   *
+   * 3.2 秒是压过的 —— 真实的翅展开要二十分钟到一小时。这跟扑翅频率压到
+   * 4~12Hz 是同一类明摆着的取舍：真实时长没法看，但**过程的形状是真的**
+   * （先快后慢、边展开边从下垂抬起）。
+   */
+  const emergeT = useRef<number | null>(null)
+  const emerge = useMemo(() => makeEmerge(), [])
+
+  useEffect(() => {
+    // nonce 为 0 是初始值，不是一次真实的羽化
+    if (emergeNonce === 0) return
+    if (REDUCED_MOTION) return
+    emergeT.current = 0
+  }, [emergeNonce])
 
   // 切换物种时从略小的尺度弹入，避免生硬替换
   useLayoutEffect(() => {
@@ -114,6 +170,7 @@ function InsectMesh({
 
     const box = new THREE.Box3().setFromObject(model.group)
     onReady(box)
+    pmark('model-committed')
   }, [model, onReady])
 
   // 剖切：用裁剪平面把虫体从矢状面切开，看内部结构关系
@@ -174,8 +231,56 @@ function InsectMesh({
         pivot.rotation.x = s * 0.45
       }
     }
-    // 按需渲染下自己续帧：还在转、还没长完，都得有下一帧
-    if (live || born.current < 1) invalidate()
+
+    /**
+     * 动作层（见 `three/motion/`）：静息微动对所有虫都跑，悬停振翅只给那八只。
+     *
+     * 跟触角摆同一个 `live` 开关，但**不能像触角那样直接停**：触角停在某个
+     * 微小偏角上没人看得出来，翅膀停在冲程中间就是一只僵在半空的虫。
+     * 所以进出各用 0.25 秒把幅度揉进揉出 —— `blend` 落到 0 时，每片翅
+     * 正好回到 `rest`（逐只目视调出来的那个展角）。
+     *
+     * 收拢的写法对任何「以 rest 为基准做偏移」的动作都成立，
+     * 所以这段不必随每个新动作改一遍 —— 那也正是 rest 契约存在的意义。
+     */
+    /**
+     * 羽化展翅优先于常规动作 —— 一只正在把翅撑开的虫不该同时在扑翅。
+     * 走完把翅归位，之后常规动作接管。
+     */
+    let emerging = false
+    if (emergeT.current !== null && model.rig?.wings?.length) {
+      /**
+       * 每帧最多推进 1/30 秒。
+       *
+       * 不夹住的话**整段羽化会被一两帧吃掉**：羽化紧接在成虫模型加载之后，
+       * 而构建几何是同步的主线程活儿，醒来的第一帧 dt 常常是几百毫秒起步
+       * （无头软件渲染下实测能到几秒）—— 一帧就把 3.2 秒的进度走完了，
+       * 用户什么也没看见。这与收拢权重那个 bug 同源：**按需渲染下 dt 不是
+       * 一个「大约 16 毫秒」的量**，凡是按 dt 推进的动画都得想清楚这一点。
+       *
+       * 夹住的代价是卡顿时羽化会比 3.2 秒长一些 —— 对一段一次性的演示动画
+       * 来说，「慢一点但看得见」远好过「准时但看不见」。
+       */
+      emergeT.current += Math.min(dt, 1 / 30)
+      const u = emergeT.current / EMERGE_SECONDS
+      if (u >= 1) {
+        emergeT.current = null
+        resetEmerge(model.rig)
+      } else {
+        emerge(model.rig, u)
+        emerging = true
+        invalidate()
+      }
+    }
+
+    if (model.rig && !REDUCED_MOTION && !emerging) {
+      flapBlend.current = stepBlend(flapBlend.current, live ? 1 : 0, dt)
+      if (flapBlend.current > 0) motionT.current += dt
+      applyBlended(model.rig, motion, motionT.current, flapBlend.current)
+    }
+
+    // 按需渲染下自己续帧：还在转、还没长完、翅还没收拢完，都得有下一帧
+    if (live || born.current < 1 || flapBlend.current > 0) invalidate()
   })
 
   return (
@@ -486,7 +591,7 @@ function StudioLights({ radius, dark }: { radius: number; dark: boolean }) {
         intensity={2.35}
         color="#fff6ea"
         castShadow
-        shadow-mapSize={COARSE ? [1024, 1024] : [2048, 2048]}
+        shadow-mapSize={[SHADOW_MAP_SIZE, SHADOW_MAP_SIZE]}
         shadow-bias={-0.0006}
         shadow-normalBias={0.02}
       >
@@ -509,7 +614,7 @@ function StudioLights({ radius, dark }: { radius: number; dark: boolean }) {
           resolution 只在桌面提到 512：这张 cubemap 只烘一次（frames={1}），
           手机维持 256 别多花那份烘图开销。 */}
       <Suspense fallback={null}>
-        <Environment resolution={COARSE ? 256 : 512} frames={1}>
+        <Environment resolution={ENV_RESOLUTION} frames={1}>
           <Lightformer form="rect" intensity={2.6} color="#fffaf2" position={[0, 4, 2]} scale={[8, 3, 1]} rotation={[-Math.PI / 3, 0, 0]} />
           <Lightformer form="rect" intensity={1.5} color="#e8f0ff" position={[-4, 1, -2]} scale={[5, 4, 1]} rotation={[0, Math.PI / 2.4, 0]} />
           <Lightformer form="rect" intensity={1.1} color="#ffeeda" position={[4, 0.5, -1.5]} scale={[4, 3, 1]} rotation={[0, -Math.PI / 2.6, 0]} />
@@ -535,6 +640,7 @@ function Scene({
   zoomNonce,
   resetNonce,
   focusAnchor,
+  lifeStage,
   onLoaded,
   onError,
   dark,
@@ -548,6 +654,8 @@ function Scene({
   zoomNonce: number
   resetNonce: number
   focusAnchor: string | null
+  /** 生活史阶段；null = 成虫（照旧走物种注册表） */
+  lifeStage: LifeStage | null
   dark: boolean
   onLoaded: () => void
   onError: (msg: string) => void
@@ -609,11 +717,24 @@ function Scene({
       }
       return null
     })
-    loadInsectModel(insect.id)
+    pmark('model-load-start')
+    /**
+     * 生活史模式下展台展示的是**阶段模型**（卵/幼虫/蛹/若虫），走
+     * `three/stages.ts` 那套独立注册表；`lifeStage` 为 null 时照旧是成虫。
+     *
+     * 分成两个注册表而不是一个，是因为阶段模型的懒加载边界就该落在这里 ——
+     * 不打开生活史的人不该下载那 11 个额外的 builder。这也是 `stages.ts` 在
+     * 本次接线之前完全没有生产代码引用、阶段 chunk 压根不进产物的原因。
+     */
+    const load = lifeStage ? loadStageModel(insect.id, lifeStage) : loadInsectModel(insect.id)
+    load
       .then((m) => {
         if (!alive) return
+        pmark('model-ready')
         setModel(m)
         notify.current.onLoaded()
+        // 模型进场后的下一次 render 就是「虫子出现」的那一帧
+        markFirstFrame()
       })
       .catch((e) => {
         if (!alive) return
@@ -622,7 +743,22 @@ function Scene({
     return () => {
       alive = false
     }
-  }, [insect.id])
+  }, [insect.id, lifeStage])
+
+  /**
+   * 羽化触发。用 nonce 而不是让 InsectMesh 自己记上一个阶段：切换阶段会
+   * 重新加载模型，加载期间 `model` 短暂为 null、InsectMesh 整个卸载，
+   * 它内部的 ref 会跟着清掉 —— 记在这一层才活得过那次卸载。
+   * 形状照抄同文件里的 zoomNonce / resetNonce。
+   */
+  const prevStage = useRef<LifeStage | null>(null)
+  const [emergeNonce, setEmergeNonce] = useState(0)
+  useEffect(() => {
+    const prev = prevStage.current
+    prevStage.current = lifeStage
+    // 蛹/若虫 → 成虫，正是羽化那一刻
+    if (lifeStage === null && (prev === 'pupa' || prev === 'nymph')) setEmergeNonce((n) => n + 1)
+  }, [lifeStage])
 
   // 取景/落影/光场一律用 frameRadius（缺省=包围半径）：大蚊这类「一团腿」
   // 物种按腿尖包围球取景会把虫体缩成一个点，按 frameRadius 则腿尖出画。
@@ -672,6 +808,8 @@ function Scene({
           {/* 聚焦某个部位时停转：镜头锁在一点上而虫还在转，那个部位会自己溜走 */}
           <InsectMesh
             model={model}
+            speciesId={insect.id}
+            emergeNonce={emergeNonce}
             mode={mode}
             spin={spin && !focus}
             pauseUntil={pauseUntil}
@@ -735,6 +873,7 @@ export const InsectCanvas = memo(function InsectCanvas({
   zoomNonce,
   resetNonce,
   focusAnchor = null,
+  lifeStage = null,
   active = true,
   theme = 'dark',
   onStatus,
@@ -749,6 +888,12 @@ export const InsectCanvas = memo(function InsectCanvas({
   resetNonce: number
   /** 由讲解弹窗下发的镜头指令，优先于工具条的聚焦模式 */
   focusAnchor?: string | null
+  /**
+   * 生活史阶段：非 null 时展台展示的是该阶段的模型（卵/幼虫/蛹/若虫）而不是成虫。
+   * 同样由讲解弹窗下发 —— 与 focusAnchor 是同一条通路、同一个形状：
+   * 弹窗翻页驱动展台，展台不反过来知道弹窗的存在。
+   */
+  lifeStage?: LifeStage | null
   /** 展台滚出视口时置 false，整个渲染循环停摆 —— 手机上省下的是真电量 */
   active?: boolean
   /** 明暗主题：决定轮廓光档位与落影颜色（材质与环境贴图不随主题动） */
@@ -785,7 +930,20 @@ export const InsectCanvas = memo(function InsectCanvas({
       // toDataURL 取帧，默认关着省一份缓冲拷贝（未来照片模式同走此门）。
       gl={{ antialias: COARSE, alpha: true, preserveDrawingBuffer: PDB, powerPreference: 'high-performance' }}
       camera={{ fov: 34, position: [2, 1, 3] }}
-      onCreated={({ gl, invalidate }) => {
+      onCreated={({ gl, invalidate, scene, camera }) => {
+        // 首帧分段计时（默认关闭，?perf=1 才装探针；见 src/perf.ts）
+        pmark('gl-created')
+        installThreeProbes(THREE)
+        installGLProbes(gl as unknown as Parameters<typeof installGLProbes>[0])
+        pexpose({ gl, scene, camera })
+        const ctx = gl.getContext()
+        pinfo({
+          coarse: COARSE,
+          dpr: gl.getPixelRatio(),
+          glRenderer: String(ctx.getParameter(ctx.RENDERER)),
+          shadowMapSize: SHADOW_MAP_SIZE,
+          envResolution: ENV_RESOLUTION,
+        })
         gl.toneMapping = THREE.ACESFilmicToneMapping
         gl.toneMappingExposure = 1.02
         /**
@@ -812,6 +970,7 @@ export const InsectCanvas = memo(function InsectCanvas({
           zoomNonce={zoomNonce}
           resetNonce={resetNonce}
           focusAnchor={focusAnchor}
+          lifeStage={lifeStage}
           dark={theme !== 'light'}
           onLoaded={() => onStatus({ loading: false, error: null })}
           onError={(msg) => onStatus({ loading: false, error: msg })}

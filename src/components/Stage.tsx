@@ -1,13 +1,18 @@
 import { Component, useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import type { Insect } from '../data/types'
+import { metamorphosisOf, prefetchStages, type LifeStage } from '../three/stages'
 import { InsectCanvas, type ViewMode } from '../three/InsectCanvas'
+import { prefetchInsectModel } from '../three/registry'
 import { webglAvailable } from '../three/webgl'
+import { EVENTS, track, type StageTool } from '../analytics'
+import { pmark } from '../perf'
 import { CompareBar } from './CompareBar'
 import { InsectGlyph } from './InsectGlyph'
 import {
   IconBox,
   IconIsolate,
   IconLayers,
+  IconPlay,
   IconReset,
   IconRotate,
   IconSection,
@@ -43,6 +48,8 @@ export function Stage({
   onCompareToggle,
   onCompareCycle,
   focusAnchor = null,
+  lifeStage = null,
+  onLifecycle,
   theme = 'dark',
 }: {
   insect: Insect
@@ -50,8 +57,18 @@ export function Stage({
   compareWith: Insect | null
   onCompareToggle: () => void
   onCompareCycle: () => void
+  /**
+   * 用户在展台上要求看生活史。
+   *
+   * 展台只负责**说出这件事**，弹窗由 App 打开 —— 沿用「弹窗驱动展台、
+   * 展台不知道弹窗存在」那条既有约定（见 Discovery 的 onLifeStage 注释），
+   * 不因为多一个入口就把方向反过来。
+   */
+  onLifecycle?: () => void
   /** 讲解弹窗下发的镜头指令 */
   focusAnchor?: string | null
+  /** 生活史阶段；非 null 时展台展示阶段模型而不是成虫。由讲解弹窗下发，与 focusAnchor 同一条通路 */
+  lifeStage?: LifeStage | null
   /** 明暗主题：透传给 3D 场景定轮廓光档位与落影颜色 */
   theme?: 'dark' | 'light'
 }) {
@@ -85,6 +102,27 @@ export function Stage({
   const [glLost, setGlLost] = useState(false)
 
   /**
+   * 首屏物种的 chunk 下载与几何构建，在 Stage **第一次渲染时**就发起，不等 WebGL 上下文。
+   *
+   * 原先这件事挂在 Scene 的 effect 上，也就是排在「React 挂载完 → r3f 量到容器尺寸
+   * → 建 WebGL 上下文 → onCreated」**之后**（实测这一段 300~380ms）。而 chunk 下载
+   * 是纯网络等待，本来可以和那一段重叠。实测「GL 就绪→模型就绪」这一段
+   * 桌面热缓存 186→5ms、移动 slow-4G 冷缓存 1066→42ms，端到端首帧桌面热缓存
+   * 约 1.6s→1.2s（方法与全部分段见 docs/perf-notes.md）。
+   *
+   * ⚠️ 几何构建本身是同步的主线程活儿，提前只是换了个位置、省不掉 —— 这里省的是
+   * **网络那一段**加上等上下文时的一点主线程空转，别指望它能把 builder 变快。
+   *
+   * 放在 webglDead 判定之后：建不起上下文的机器只会看到 SVG 剪影兜底页，
+   * 没必要为它下载并构建两万多面的几何。useState 的惰性初始化 = 只在首次渲染跑一次，
+   * registry 自带按 id 去重与在途合并，稍后 Scene 再要同一只虫拿到的是同一个 promise。
+   */
+  useState(() => {
+    if (!webglDead) prefetchInsectModel(insect.id)
+    return null
+  })
+
+  /**
    * 展台滚出视口就停掉渲染循环。
    *
    * 手机上整页竖排，用户在下面读图鉴数据时展台还在每帧画 —— 白烧 GPU，
@@ -113,11 +151,22 @@ export function Stage({
   /**
    * 加载提示延迟 180ms 再露面：模型按 id 缓存，切回看过的物种是瞬时的，
    * 立刻显示会让「正在生成…」闪一下就消失，比不显示更让人分神。
+   *
+   * ⚠️ **首屏这一次不延迟**（`first.current`）。首屏必然要等一秒以上
+   * （线上实测热缓存约 2.2s、冷缓存约 3.7s，分段见 docs/perf-notes.md），
+   * 延迟只是让空展台多空 180ms。第二只虫起才有「可能瞬时」这回事。
    */
+  const first = useRef(true)
   const [showLoading, setShowLoading] = useState(false)
   useEffect(() => {
     if (!status.loading) {
+      first.current = false
       setShowLoading(false)
+      return
+    }
+    if (first.current) {
+      setShowLoading(true)
+      pmark('stage-placeholder')
       return
     }
     const timer = window.setTimeout(() => setShowLoading(true), 180)
@@ -125,6 +174,17 @@ export function Stage({
   }, [status.loading])
 
   const toggleMode = (m: ViewMode) => setMode((cur) => (cur === m ? 'normal' : m))
+
+  /**
+   * 这只虫做了阶段模型吗 —— 直接问注册表（有蛹＝完全变态、有若虫＝不完全变态），
+   * 不另设一张「哪 8 种有生活史」的名单：名单与文件两处都能改，迟早对不上。
+   * 返回的是完整路线（含成虫），所以「4 个阶段」这种说法用它的长度就是对的。
+   */
+  const lifeRoute = metamorphosisOf(insect.id)
+
+  /** 工具条六个按钮共用同一条埋点，「对比」不算在内 —— 它换的是物种，
+      走 App.tsx 里的 species_switch(source:'compare')，见 analytics.ts 的注释 */
+  const clickTool = (tool: StageTool) => track(EVENTS.STAGE_TOOL, { tool })
 
   return (
     <section className={`card stage-height ${s.stage}`}>
@@ -152,10 +212,19 @@ export function Stage({
               mode={mode}
               spin={spin}
               openHotspot={openHotspot}
-              onToggleHotspot={setOpenHotspot}
+              onToggleHotspot={(id) => {
+                // 只有真的打开了某个标注点才算一次点击；传 null 是关掉
+                // （再点一次同一个点、或点在模型外），不该也记一条
+                if (id) {
+                  const anchor = insect.hotspots.find((h) => h.id === id)?.anchor ?? id
+                  track(EVENTS.HOTSPOT_CLICK, { anchor })
+                }
+                setOpenHotspot(id)
+              }}
               zoomNonce={zoomNonce}
               resetNonce={resetNonce}
               focusAnchor={focusAnchor}
+              lifeStage={lifeStage}
               theme={theme}
               onStatus={onStatus}
               onContextLoss={setGlLost}
@@ -163,6 +232,36 @@ export function Stage({
           </CanvasBoundary>
         )}
       </div>
+
+      {/*
+        生活史入口。为什么放在展台右上角：
+
+        2026-08-19 埋点实测，生活史此前唯一的入口是展台**下方**那张卡片，而它在
+        1440×900 与 1280×720 上都落在折叠线以下（y=993 / y=823），1920×1080 也只
+        露出一角。结果是有阶段模型的 8 种加上首页落地约 1975 次浏览里，生活史只被
+        打开 5 次 —— 约 1/400。不是没人想看，是没人看得见。
+
+        而同一份数据里展台工具条被用了 1059 次：**人本来就盯着展台**。所以入口挪到
+        展台上，与左上角的目/变态类型标签左右对称 —— 那个标签已经写着「完全变态」，
+        读者有了概念却没有可点的东西，这里正好接上。
+
+        只对做了阶段模型的物种出现（`metamorphosisOf` 直接问注册表，不另设名单）；
+        WebGL 兜底时不出现 —— 点开它展台要换成卵/幼虫的立体标本，兜底页做不到，
+        照本站的规矩不留只有样子的按钮。
+      */}
+      {!webglDead && onLifecycle && lifeRoute && (
+        <button
+          className={s.lifeCue}
+          onClick={onLifecycle}
+          // 悬停即预取阶段模型：弹窗一打开就要换标本，先下好这一步就不会白等
+          onMouseEnter={() => prefetchStages(insect.id)}
+          onFocus={() => prefetchStages(insect.id)}
+          aria-label={t('stage.lifeCueAria', { name: insect.name, n: lifeRoute.length })}
+        >
+          <IconPlay size={14} />
+          {t('stage.lifeCue', { n: lifeRoute.length })}
+        </button>
+      )}
 
       <div className={s.orderTag}>
         <span className={s.orderDot} style={{ background: insect.accent }} />
@@ -174,18 +273,34 @@ export function Stage({
       {/* 工具条整条随 WebGL 一起撤：旋转/剖切/聚焦全是对着 canvas 说话的，
           兜底页上留一排按不动的按钮比没有更糟（本站原则：不留只有样子的按钮） */}
       {!webglDead && <div className={s.rail}>
-        <button className={s.tool} data-active={spin} onClick={() => setSpin((v) => !v)}>
+        <button
+          className={s.tool}
+          data-active={spin}
+          onClick={() => {
+            clickTool('rotate')
+            setSpin((v) => !v)
+          }}
+        >
           <IconRotate size={17} />
           <span className={s.toolLabel}>{t('stage.tool.rotate')}</span>
         </button>
-        <button className={s.tool} onClick={() => setZoomNonce((n) => n + 1)}>
+        <button
+          className={s.tool}
+          onClick={() => {
+            clickTool('zoom')
+            setZoomNonce((n) => n + 1)
+          }}
+        >
           <IconZoom size={17} />
           <span className={s.toolLabel}>{t('stage.tool.zoom')}</span>
         </button>
         <button
           className={s.tool}
           data-active={mode === 'isolate'}
-          onClick={() => toggleMode('isolate')}
+          onClick={() => {
+            clickTool('focus')
+            toggleMode('isolate')
+          }}
         >
           <IconIsolate size={17} />
           <span className={s.toolLabel}>{t('stage.tool.focus')}</span>
@@ -193,7 +308,10 @@ export function Stage({
         <button
           className={s.tool}
           data-active={mode === 'section'}
-          onClick={() => toggleMode('section')}
+          onClick={() => {
+            clickTool('section')
+            toggleMode('section')
+          }}
         >
           <IconSection size={17} />
           <span className={s.toolLabel}>{t('stage.tool.section')}</span>
@@ -201,7 +319,10 @@ export function Stage({
         <button
           className={s.tool}
           data-active={mode === 'layers'}
-          onClick={() => toggleMode('layers')}
+          onClick={() => {
+            clickTool('layers')
+            toggleMode('layers')
+          }}
         >
           <IconLayers size={17} />
           <span className={s.toolLabel}>{t('stage.tool.layers')}</span>
@@ -214,6 +335,7 @@ export function Stage({
         <button
           className={s.tool}
           onClick={() => {
+            clickTool('reset')
             setResetNonce((n) => n + 1)
             setMode('normal')
             setOpenHotspot(null)
@@ -245,8 +367,20 @@ export function Stage({
           {status.error ? (
             <div className={s.error}>{t('stage.error', { error: status.error })}</div>
           ) : (
+            /**
+             * 加载态先摆一张该物种的剪影 —— 不是装饰，是本轮性能测量的结论。
+             *
+             * 首帧真实耗时压不到一秒以内：线上热缓存约 2.2s、冷缓存约 3.7s，
+             * 其中网络 ~0.9s 与 builder ~0.5s 都动不了（分段见 docs/perf-notes.md）。
+             * 既然等待去不掉，就别让展台在这一两秒里**完全空着** —— 剪影跟着首屏
+             * 内容一起就位：「展台上第一次出现这只虫的形状」实测从 1592ms 提到
+             * 220ms（无头桌面热缓存），真机上落在 542ms。立体标本长出来就换掉它。
+             * 用的是 InsectGlyph 里现成的 24×24 剪影，零新增资产。
+             */
             <div className={s.spinner}>
-              <span className={s.spinnerRing} />
+              <span className={s.developing}>
+                <InsectGlyph id={insect.id} size={96} color={insect.accent} />
+              </span>
               {t('stage.loading', { name: insect.name })}
             </div>
           )}

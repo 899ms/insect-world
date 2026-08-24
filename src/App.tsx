@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Order } from './data/types'
+import { EVENTS, track, type DiscoverySource } from './analytics'
 import { useLabels, useLocale, useSpecies, useT } from './i18n/useT'
 import { notesToMarkdown, useFieldNotes } from './hooks/useFieldNotes'
 import { NotesPanel } from './components/NotesPanel'
@@ -13,6 +14,7 @@ import { Stage } from './components/Stage'
 import { TopBar } from './components/TopBar'
 import { IconGrid, IconSparkle } from './components/icons'
 import { isKnownSpecies, prefetchInsectModel } from './three/registry'
+import type { LifeStage } from './three/stages'
 import { THEME_COLOR, THEME_KEY, resolveTheme, type Theme } from './theme'
 import { canonicalPath, isLegacySpeciesUrl, speciesFromUrl } from './i18n/hrefForLocale'
 import { LanguageHint } from './i18n/LanguageHint'
@@ -43,11 +45,48 @@ export default function App() {
   const [activeId, setActiveId] = useState(
     () => speciesFromUrl(location.pathname, location.search, SPECIES.map((i) => i.id)) ?? SPECIES[0].id,
   )
+
+  /**
+   * 深链埋点：只在挂载时判定一次，且只有地址栏真的带着识别出来的物种
+   * （不是没带、回落到默认物种）才算一次 deeplink —— 裸首页访问不该被
+   * 计成「深链」，那会把首页真实的落地量做低。
+   *
+   * 没有复用上面 activeId 的初值：那个初值已经和 SPECIES[0] 的回落结果
+   * 合并了，从结果上分不出「本来就带物种」还是「没带、回落的」，只能
+   * 重新问一次地址栏。之后地址栏会被下面的 URL 同步 effect 改写，
+   * 所以这里必须留空依赖数组，只在首帧问这一次。
+   */
+  useEffect(() => {
+    const fromUrl = speciesFromUrl(location.pathname, location.search, SPECIES.map((i) => i.id))
+    const target = fromUrl ? SPECIES.find((i) => i.id === fromUrl) : undefined
+    if (target) track(EVENTS.SPECIES_SWITCH, { source: 'deeplink', species_id: target.id, order: target.order })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   const [galleryOpen, setGalleryOpen] = useState(false)
   const [notesOpen, setNotesOpen] = useState(false)
   const [compareId, setCompareId] = useState<string | null>(null)
-  const [discovery, setDiscovery] = useState<DiscoveryKind | null>(null)
+  /**
+   * 打开哪个弹窗、从哪个入口打开的。
+   *
+   * 带上 source 是为了能验证「生活史没人看是因为入口在折叠线以下」这个判断 ——
+   * 见 analytics.ts 的 DISCOVERY_SOURCES 注释。只记打开数说不清是新入口起了作用
+   * 还是那几天流量高。
+   */
+  const [discovery, setDiscovery] = useState<{
+    kind: DiscoveryKind
+    source: DiscoverySource
+  } | null>(null)
+  const openDiscovery = useCallback(
+    (kind: DiscoveryKind, source: DiscoverySource) => setDiscovery({ kind, source }),
+    [],
+  )
   const [focusAnchor, setFocusAnchor] = useState<string | null>(null)
+  /**
+   * 展台正在展示的生活史阶段；null = 成虫。由生活史讲解弹窗逐步下发，
+   * 与 focusAnchor 同一条通路（弹窗驱动展台，展台不知道弹窗的存在）。
+   */
+  const [lifeStage, setLifeStage] = useState<LifeStage | null>(null)
   const [orderFilter, setOrderFilter] = useState<Order | null>(null)
   const [notedOnly, setNotedOnly] = useState(false)
   /** 双主题：浅=纸感图鉴（默认），暗=博物馆之夜；选择持久化本机。
@@ -71,6 +110,16 @@ export default function App() {
     () => SPECIES.find((i) => i.id === activeId) ?? SPECIES[0],
     [activeId],
   )
+
+  /**
+   * 换虫必须复位生活史阶段。不复位的后果不是「显示得不对」而是**报错**：
+   * 阶段模型是逐物种做的，只有少数几种有；停在「蛹」上切到七星瓢虫，
+   * `loadStageModel('ladybird', 'pupa')` 会抛「未注册的生活史阶段」，
+   * 展台盖上错误提示层。
+   */
+  useEffect(() => {
+    setLifeStage(null)
+  }, [activeId])
 
   /**
    * 选中的物种写回地址栏与标题 —— 地址栏随时可复制转发，标签页多开时
@@ -152,7 +201,9 @@ export default function App() {
       const pool = listed.length > 0 ? listed : SPECIES
       const idx = pool.findIndex((i) => i.id === activeId)
       const next = idx === -1 ? (delta > 0 ? 0 : pool.length - 1) : (idx + delta + pool.length) % pool.length
-      select(pool[next].id)
+      const target = pool[next]
+      track(EVENTS.SPECIES_SWITCH, { source: 'keyboard', species_id: target.id, order: target.order })
+      select(target.id)
     },
     [activeId, select, listed, SPECIES],
   )
@@ -184,19 +235,38 @@ export default function App() {
     [activeId, SPECIES],
   )
 
+  /**
+   * 两个函数都不用 setCompareId 的函数式更新形式来夹带埋点 —— React 18
+   * StrictMode 在开发环境会把 state 更新函数（updater）额外多跑一遍以探测
+   * 副作用，塞在里面的 track() 调用会被跟着多发一次。改成先用当前渲染里
+   * 已经拿到的 compareId 算出 next，track 完再调用 setCompareId(next)，
+   * track 就是一条普通语句，不会被这套探测机制重放。
+   */
   const toggleCompare = useCallback(() => {
-    setCompareId((cur) => (cur ? null : pickPeer(1)))
-  }, [pickPeer])
+    if (compareId) {
+      setCompareId(null)
+      return
+    }
+    const next = pickPeer(1)
+    const target = SPECIES.find((i) => i.id === next)
+    if (target) track(EVENTS.SPECIES_SWITCH, { source: 'compare', species_id: next, order: target.order })
+    setCompareId(next)
+  }, [compareId, pickPeer, SPECIES])
 
   const cycleCompare = useCallback(() => {
-    setCompareId((cur) => {
-      if (!cur) return pickPeer(1)
-      const from = SPECIES.findIndex((i) => i.id === cur)
-      let next = (from + 1) % SPECIES.length
-      if (SPECIES[next].id === activeId) next = (next + 1) % SPECIES.length
-      return SPECIES[next].id
-    })
-  }, [activeId, pickPeer, SPECIES])
+    let next: string
+    if (!compareId) {
+      next = pickPeer(1)
+    } else {
+      const from = SPECIES.findIndex((i) => i.id === compareId)
+      let idx = (from + 1) % SPECIES.length
+      if (SPECIES[idx].id === activeId) idx = (idx + 1) % SPECIES.length
+      next = SPECIES[idx].id
+    }
+    const target = SPECIES.find((i) => i.id === next)
+    if (target) track(EVENTS.SPECIES_SWITCH, { source: 'compare', species_id: next, order: target.order })
+    setCompareId(next)
+  }, [activeId, compareId, pickPeer, SPECIES])
 
   // 换物种时，之前挑的对照对象若正好是新选中的，就顺延一个
   useEffect(() => {
@@ -216,7 +286,7 @@ export default function App() {
         insects={SPECIES}
         activeId={activeId}
         onPick={select}
-        onLessons={() => setDiscovery('lesson')}
+        onLessons={() => openDiscovery('lesson', 'topbar')}
         onLibrary={() => setGalleryOpen(true)}
         onNotes={() => setNotesOpen(true)}
         onExplore={backToExplore}
@@ -226,7 +296,11 @@ export default function App() {
         onCopyNotes={copyNotes}
         onClearNotes={clear}
         theme={theme}
-        onToggleTheme={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
+        onToggleTheme={() => {
+          const next = theme === 'dark' ? 'light' : 'dark'
+          track(EVENTS.THEME_TOGGLE, { theme: next })
+          setTheme(next)
+        }}
       />
 
       <main className="workbench">
@@ -248,16 +322,22 @@ export default function App() {
           onCompareToggle={toggleCompare}
           onCompareCycle={cycleCompare}
           focusAnchor={focusAnchor}
+          lifeStage={lifeStage}
+          onLifecycle={() => openDiscovery('lifecycle', 'stage')}
           theme={theme}
         />
-        <DetailPanel insect={insect} onCompare={toggleCompare} onDiscover={setDiscovery} />
+        <DetailPanel
+          insect={insect}
+          onCompare={toggleCompare}
+          onDiscover={(kind) => openDiscovery(kind, 'panel')}
+        />
       </main>
 
       <BottomCards
         insect={insect}
         peers={SPECIES}
         onCompare={toggleCompare}
-        onDiscover={setDiscovery}
+        onDiscover={(kind) => openDiscovery(kind, 'card')}
         onExplore={() => setGalleryOpen(true)}
       />
 
@@ -294,11 +374,13 @@ export default function App() {
 
       {discovery && (
         <Discovery
-          kind={discovery}
+          kind={discovery.kind}
+          source={discovery.source}
           insect={insect}
           guide={getGuide(insect.id)}
           onClose={() => setDiscovery(null)}
           onFocusAnchor={setFocusAnchor}
+          onLifeStage={setLifeStage}
         />
       )}
     </div>

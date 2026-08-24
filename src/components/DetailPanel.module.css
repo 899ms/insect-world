@@ -80,6 +80,38 @@
   margin-top: 14px;
 }
 
+/* 「看实物照片」：紧贴总述的黄铜小胶囊。
+   要显眼 —— 它是程序化模型之外唯一能看到实物的出口，而上一版埋在按钮组最底
+   （右栏可视 688px / 内容 1358px，它在 y≈1306），有人专门来找都没找到。
+   但也不能盖过主按钮：所以是**描边胶囊**不是通栏实底，宽度随内容收，
+   与下面那一列通栏按钮在体量上明确分层。
+   配色沿用 --brass 一族，对比度由 contrast.test.ts 守着。 */
+.photoLink {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 6px 12px;
+  border: 1px solid var(--brass);
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--brass-bright);
+  text-decoration: none;
+  background: transparent;
+  transition: background 0.16s ease, color 0.16s ease, transform 0.16s ease;
+}
+
+.photoLink svg {
+  color: currentColor;
+}
+
+.photoLink:hover {
+  background: var(--brass);
+  color: var(--on-primary);
+  transform: translateY(-1px);
+}
+
 .rule {
   height: 1px;
   background: var(--line);
@@ -184,6 +216,37 @@
   gap: 9px;
 }
 
+/* 主按钮的栏内吸底条 —— 理由见 DetailPanel.tsx 里那段注释（可视 688 / 内容 1350）。
+   负外边距把左右与底部的栏内边距抵掉，让它铺满栏宽、贴住栏底。
+   实底 --paper 而不是半透明：下面滚过去的是密排的数据行，
+   透出来会糊成一团，反而不如干脆挡住。 */
+.stickyAction {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  margin: 16px -20px -20px;
+  padding: 12px 20px 16px;
+  /* 必须是 --paper-solid 不是 --paper：后者带透明度（配 .card 的 backdrop-filter 用），
+     吸底条用它会把下面滚过去的数据行透出来，糊成一片。全站已备好实色那一档。 */
+  background: var(--paper-solid);
+  border-top: 1px solid var(--line);
+}
+
+/* 竖排布局下右栏不再是独立滚动容器（global.css 的 .detail-panel { height: auto }），
+   再吸底就会贴着视口底部乱飘 —— 还原成普通块。 */
+@media (max-width: 900px) {
+  .stickyAction {
+    position: static;
+    display: block;
+    margin: 16px 0 0;
+    padding: 0;
+    background: transparent;
+    border-top: 0;
+  }
+}
+
 .primary {
   display: flex;
   align-items: center;
@@ -234,17 +297,6 @@
 
 .ghost.wide svg {
   color: var(--muted);
-}
-
-/* 复制成功的短暂确认态：整钮转苔绿 2 秒。变色而不弹 toast ——
-   反馈就发生在手指按下去的那个位置，视线不用移开 */
-.share[data-copied] {
-  color: var(--sage);
-  border-color: var(--sage);
-}
-
-.share[data-copied] svg {
-  color: var(--sage);
 }
 
 /* ---------------------------------------------------------------- 页脚元数据 */
@@ -326,3 +378,38 @@
 .panel > *:nth-child(8) { animation-delay: 245ms; }
 .panel > *:nth-child(9) { animation-delay: 280ms; }
 .panel > *:nth-child(n + 10) { animation-delay: 315ms; }
+
+/*
+  身份区里那一行次要动作（实物照片外链 + 分享）。
+
+  两个都用 .photoLink 那副黄铜小胶囊的样子 —— 它们是同一类东西，长得一样
+  才读得出「这是一组」。wrap 是必须的：英文站的两条文案都更长
+  （"See real photos on iNaturalist" + "Copy page link"），窄栏下放不下一行。
+
+  gap 用 8px 而不是更大：这一行要显眼，但不能横向铺开到跟下面的「关键数据」
+  抢分量 —— 主按钮才是这一栏的重点。
+*/
+.idActions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 分享是 <button> 不是 <a>，得把浏览器给按钮的默认外观按掉 */
+.shareChip {
+  margin-top: 12px;
+  font-family: inherit;
+  line-height: inherit;
+  cursor: pointer;
+}
+
+/*
+  复制成功的短暂确认态：整钮转苔绿 2 秒。变色而不弹 toast —— 反馈就发生在
+  手指按下去的那个位置，视线不用移开。这条是从原来 .share 上原样搬过来的，
+  换了位置不代表这个决定作废。
+*/
+.shareChip[data-copied] {
+  color: var(--sage);
+  border-color: var(--sage);
+}
