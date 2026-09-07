@@ -231,6 +231,29 @@ export function Discovery({
      * 从分母里消失，实验会读反：看着像这条路径拉低了完课率。
      */
     const completeLesson = () => track(EVENTS.LESSON_COMPLETE, { total: steps.length })
+
+    /**
+     * 讲解的最后一步**当场问一道题**，不再只给一个「做个小测」的入口。
+     *
+     * 由来（2026-09-06 读埋点）：2026-08-28 已经把小测搬到了全站参与度最高的
+     * 那一刻 —— 讲解读完。九天下来每百访问的小测打开数 1.20 → **1.23**，
+     * 纹丝不动；196 次讲解读完里只有 17 次点开小测（8.7%），答题 11、交卷 5。
+     *
+     * 位置已经是最好的位置了，所以那 8.7% 量的**不是「想不想答题」，
+     * 是「愿不愿意再开一层面板」**。题目内容早就写好了，砍掉可惜；
+     * 换个形态才测得到真问题：把第一道题直接摆在读完的那一页上，
+     * 走到这一步的人都会遇到它，一次点击也不用多花。
+     *
+     * 想接着做的仍然可以点「再做几题」走原来那条路 —— 那条路的读数
+     * （`quiz_answer{where:'quiz'}`）保持可比，好跟内嵌这道题分开看。
+     *
+     * ⚠️ 读数口径：「有多少人看到了题」= `lesson_step{step === total}`，
+     * 不是 `lesson_complete`（那个要点了「看完了」才报）。
+     */
+    const inlineQ = last ? guide.quiz[0] : undefined
+    const inlinePick = picked[0]
+    const inlineAnswered = inlinePick !== null && inlinePick !== undefined
+
     return shell(
       <>
         <h2 className={s.title}>{current?.title ?? insect.name}</h2>
@@ -245,6 +268,42 @@ export function Discovery({
             })}
           </span>
         )}
+        {inlineQ && (
+          <div className={s.inlineQuiz}>
+            <div className={s.eyebrow}>{t('discovery.inlineQuiz')}</div>
+            <p className={s.question}>{inlineQ.question}</p>
+            <div className={s.options}>
+              {inlineQ.options.map((opt, i) => {
+                let state: string | undefined
+                if (inlineAnswered) {
+                  if (i === inlineQ.answer) state = 'correct'
+                  else if (i === inlinePick) state = 'wrong'
+                  else state = 'dim'
+                }
+                return (
+                  <button
+                    key={opt}
+                    className={s.option}
+                    data-state={state}
+                    disabled={inlineAnswered}
+                    onClick={() => {
+                      track(EVENTS.QUIZ_ANSWER, { correct: i === inlineQ.answer, where: 'lesson' })
+                      setPicked((prev) => prev.map((p, k) => (k === 0 ? i : p)))
+                    }}
+                  >
+                    {inlineAnswered && (i === inlineQ.answer || i === inlinePick) && (
+                      <span className={s.mark} data-kind={i === inlineQ.answer ? 'correct' : 'wrong'}>
+                        {i === inlineQ.answer ? '✓' : '×'}
+                      </span>
+                    )}
+                    {opt}
+                  </button>
+                )
+              })}
+            </div>
+            {inlineAnswered && <div className={s.explain}>{inlineQ.explain}</div>}
+          </div>
+        )}
         <div className={s.steps}>
           {steps.map((st, i) => (
             <span key={st.title} className={s.stepDot} data-on={i === step} />
@@ -254,7 +313,7 @@ export function Discovery({
           <button className={s.secondary} onClick={() => goTo(step - 1)} disabled={step === 0}>
             {t('discovery.back')}
           </button>
-          {last && (guide?.quiz.length ?? 0) > 0 && onSwitchKind && (
+          {last && guide.quiz.length > 1 && onSwitchKind && (
             <button
               className={s.secondary}
               onClick={() => {
@@ -265,7 +324,7 @@ export function Discovery({
                 onSwitchKind('quiz', 'lesson')
               }}
             >
-              {t('discovery.toQuiz')}
+              {t(inlineAnswered ? 'discovery.moreQuiz' : 'discovery.toQuiz')}
             </button>
           )}
           <button
@@ -314,8 +373,16 @@ export function Discovery({
       insect.lifecycle.length === route.length
         ? insect.lifecycle
         : route.map((st) => t(STAGE_KEY[st]))
-    const cur = route[Math.min(step, route.length - 1)]
-    const last = step >= route.length - 1
+    /**
+     * 下标钳一次，正文/步点/当前阶段**共用同一个** —— 三处各自用 `step` 是这个
+     * 组件栽过的跟头：`cur` 钳了、`stageLabels[step]` 与步点没钳，越界时正文是
+     * `undefined`（一片空白）、没有一颗点亮着，而且不抛错、悄悄地烂着。
+     * 越界从哪来是另一回事（key 少挂一样就会带着旧进度冲进来），
+     * 但渲染这一侧不该指望上游永远不出错。
+     */
+    const i = Math.min(step, route.length - 1)
+    const cur = route[i]
+    const last = i >= route.length - 1
     /**
      * 成虫也算「台上有标本」—— 它走的是常规物种注册表，不在 `built` 里，
      * 但展台上确确实实摆着它。第一版写成 `cur !== 'adult' && built.has(cur)`，
@@ -335,12 +402,12 @@ export function Discovery({
         <h2 className={s.title}>{t('discovery.lifecycle.title', { name: insect.name })}</h2>
         <div className={s.stepMeta}>
           {t('discovery.lifecycle.stepOf', {
-            cur: step + 1,
+            cur: i + 1,
             total: route.length,
             type: labels.metamorphosis[insect.metamorphosis],
           })}
         </div>
-        <p className={s.stepBody}>{stageLabels[step]}</p>
+        <p className={s.stepBody}>{stageLabels[i]}</p>
         <p className={s.stepBody}>
           {t(
             insect.metamorphosis === 'complete'
@@ -352,12 +419,12 @@ export function Discovery({
           {t(hasModel ? 'discovery.lifecycle.onStage' : 'discovery.lifecycle.noModel')}
         </span>
         <div className={s.steps}>
-          {route.map((st, i) => (
-            <span key={st} className={s.stepDot} data-on={i === step} />
+          {route.map((st, n) => (
+            <span key={st} className={s.stepDot} data-on={n === i} />
           ))}
         </div>
         <div className={s.actions}>
-          <button className={s.secondary} onClick={() => goTo(step - 1)} disabled={step === 0}>
+          <button className={s.secondary} onClick={() => goTo(i - 1)} disabled={i === 0}>
             {t('discovery.back')}
           </button>
           <button
@@ -367,7 +434,7 @@ export function Discovery({
                 track(EVENTS.LESSON_COMPLETE, { total: route.length })
                 close()
               } else {
-                goTo(step + 1)
+                goTo(i + 1)
               }
             }}
           >
@@ -419,7 +486,7 @@ export function Discovery({
                 data-state={state}
                 disabled={answered}
                 onClick={() => {
-                  track(EVENTS.QUIZ_ANSWER, { correct: i === q.answer })
+                  track(EVENTS.QUIZ_ANSWER, { correct: i === q.answer, where: 'quiz' })
                   setPicked((prev) => prev.map((p, k) => (k === step ? i : p)))
                 }}
               >
